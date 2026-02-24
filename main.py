@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 import re
+import requests  # добавил импорт
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from telethon import TelegramClient
@@ -28,7 +29,7 @@ api_id = int(os.environ.get("API_ID"))
 api_hash = os.environ.get("API_HASH")
 phone_number = os.environ.get("PHONE_NUMBER")
 my_user_id = int(os.environ.get("MY_USER_ID"))
-redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+bot_token = os.environ.get("BOT_TOKEN")  # добавил токен бота
 
 # Каналы для мониторинга
 CHANNELS = [
@@ -101,6 +102,42 @@ def clean_channel(channel):
             channel = channel.split("t.me/")[-1]
         channel = channel.lstrip("@")
     return channel
+
+
+def send_telegram_message(text: str) -> bool:
+    """Отправляет сообщение через бота"""
+    if not bot_token:
+        logger.error("BOT_TOKEN not set")
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    # Экранируем спецсимволы для Markdown
+    # Заменяем ** на жирный текст, но экранируем остальное
+    escaped_text = (
+        text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    )
+    # Возвращаем ** обратно для жирного текста
+    escaped_text = escaped_text.replace("\\*\\*", "**")
+
+    payload = {
+        "chat_id": my_user_id,
+        "text": escaped_text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            logger.info("Message sent via bot")
+            return True
+        else:
+            logger.error(f"Failed to send message: {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Error sending message via bot: {e}")
+        return False
 
 
 class FileState:
@@ -485,23 +522,22 @@ async def monitor_channels():
         except Exception as e:
             logger.error(f"Error checking {channel}: {e}")
 
-    # Отправка результатов
+    # Отправка результатов через бота (а не через клиента)
     if found_messages:
         for msg in found_messages:
             text = f"✈️ **{msg['channel']}**\n"
             text += f"_{msg['summary']}_\n\n"
             text += msg["preview"] + f"\n\n[👉 Открыть пост]({msg['link']})"
 
-            await client.send_message(
-                my_user_id, text, parse_mode="md", link_preview=False
-            )
+            # Отправляем через бота
+            send_telegram_message(text)
 
-        logger.info(f"Sent {len(found_messages)} matches")
+        logger.info(f"Sent {len(found_messages)} matches via bot")
     else:
         logger.info("No matches found")
-        await client.send_message(
-            my_user_id,
-            f"🔍 Мониторинг: новых предложений в Индию на март {TARGET_YEAR} не найдено",
+        # Отправляем уведомление через бота
+        send_telegram_message(
+            f"🔍 Мониторинг: новых предложений в Индию на март {TARGET_YEAR} не найдено"
         )
 
     await client.disconnect()
@@ -513,6 +549,9 @@ async def main():
         await monitor_channels()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+        # Пробуем отправить ошибку через бота
+        if bot_token:
+            send_telegram_message(f"❌ Ошибка мониторинга: {str(e)[:200]}")
         raise
 
 
