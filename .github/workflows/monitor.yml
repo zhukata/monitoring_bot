@@ -1,0 +1,47 @@
+name: Telegram Flight Monitor
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # каждые 30 минут
+  workflow_dispatch:  # ручной запуск
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # чтобы не висел долго
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run flight monitor
+      env:
+        API_ID: ${{ secrets.API_ID }}
+        API_HASH: ${{ secrets.API_HASH }}
+        PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+        MY_USER_ID: ${{ secrets.MY_USER_ID }}
+        REDIS_URL: ${{ secrets.REDIS_URL }}
+      run: python main.py
+      
+    - name: Upload session file (if changed)
+      uses: actions/upload-artifact@v3
+      with:
+        name: session
+        path: session.session
+        retention-days: 7

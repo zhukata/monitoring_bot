@@ -1,12 +1,16 @@
+import json
 import os
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from telethon import TelegramClient
-import redis.asyncio as redis
 from dotenv import load_dotenv
+
+
+if os.path.exists("session.session"):
+    os.chmod("session.session", 0o600)  # правильные права доступа
 
 
 load_dotenv()
@@ -83,6 +87,10 @@ SEND_IF_NO_DATE = True
 MIN_TEXT_LENGTH = 50
 # =====================================
 
+# Файл для хранения состояния
+STATE_FILE = "bot_state.json"
+# =====================================
+
 
 def clean_channel(channel):
     """Очищает ссылку на канал"""
@@ -95,87 +103,99 @@ def clean_channel(channel):
     return channel
 
 
-class RedisState:
-    """Управление состоянием в Redis"""
+class FileState:
+    """Управление состоянием в файле"""
 
-    def __init__(self, redis_url: str, ttl_days: int = 7):
-        self.redis_url = redis_url
-        self.ttl_seconds = ttl_days * 24 * 60 * 60
-        self.redis = None
+    def __init__(self, state_file: str):
+        self.state_file = state_file
+        self.state = self._load()
 
-    async def connect(self):
-        self.redis = await redis.from_url(self.redis_url)
-        logger.info("Connected to Redis")
+    def _load(self) -> Dict:
+        """Загружает состояние из файла"""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
 
-    async def disconnect(self):
-        if self.redis:
-            await self.redis.aclose()
+    def _save(self):
+        """Сохраняет состояние в файл"""
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=2, ensure_ascii=False)
 
-    async def get_last_id(self, channel: str) -> int:
-        key = f"tg_monitor:last_id:{channel}"
-        value = await self.redis.get(key)
-        return int(value) if value else 0
+    def get_last_id(self, channel: str) -> int:
+        """Получить последний обработанный ID"""
+        return self.state.get(channel, {}).get("last_id", 0)
 
-    async def set_last_id(self, channel: str, message_id: int):
-        key = f"tg_monitor:last_id:{channel}"
-        await self.redis.setex(key, self.ttl_seconds, message_id)
+    def set_last_id(self, channel: str, message_id: int):
+        """Сохранить последний ID"""
+        if channel not in self.state:
+            self.state[channel] = {}
+        self.state[channel]["last_id"] = message_id
+        self.state[channel]["last_check"] = datetime.now().isoformat()
+        self._save()
 
-    async def is_duplicate(self, channel: str, message_id: int) -> bool:
-        key = f"tg_monitor:msg:{channel}:{message_id}"
-        return await self.redis.exists(key)
+    def is_duplicate(self, channel: str, message_id: int) -> bool:
+        """Проверка на дубликат (храним последние 100 ID)"""
+        if channel not in self.state:
+            return False
+        processed = self.state[channel].get("processed_ids", [])
+        return message_id in processed
 
-    async def mark_processed(self, channel: str, message_id: int):
-        key = f"tg_monitor:msg:{channel}:{message_id}"
-        await self.redis.setex(key, self.ttl_seconds, "1")
+    def mark_processed(self, channel: str, message_id: int):
+        """Отметить сообщение как обработанное"""
+        if channel not in self.state:
+            self.state[channel] = {}
+
+        # Храним последние 100 ID чтобы не разрастался файл
+        processed = self.state[channel].get("processed_ids", [])
+        processed.append(message_id)
+        # Оставляем только последние 100
+        if len(processed) > 100:
+            processed = processed[-100:]
+        self.state[channel]["processed_ids"] = processed
+        self._save()
 
 
 class FlightSearchAnalyzer:
     """Анализатор сообщений на наличие билетов в Индию"""
 
     def __init__(self):
-        # Паттерны для дат
         self.date_patterns = [
-            # 05.03.26, 05.03.2026
             r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})",
-            # 05.03
             r"(\d{1,2})[./](\d{1,2})(?![./\d])",
-            # 5 марта, 05 марта
             r"(\d{1,2})\s+(марта?|мар|march?|mar)\b",
-            # март 5
             r"(март|march|mar)\s+(\d{1,2})\b",
         ]
 
-        # Паттерны для цен
         self.price_patterns = [
             r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s?(?:руб|р\.?|₽)\b",
             r"за\s+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s*(?:руб|р\.?|₽)",
             r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s*р(?!уб)",
         ]
 
-        # Для быстрой проверки наличия дат
         self.has_date_pattern = re.compile(
             r"\d{1,2}[./]\d{1,2}|\d{1,2}\s+(мар|апр|май|июн|июл|авг|сен|окт|ноя|дек)|(янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек)\s+\d{1,2}",
             re.IGNORECASE,
         )
 
     def has_india_destination(self, text: str) -> bool:
-        """Проверяет, есть ли в тексте упоминание Индии/Гоа (только целые слова)"""
+        """Проверяет наличие Индии/Гоа"""
         if not text:
             return False
-
-        # Используем регулярное выражение с границами слов
         return bool(DEST_PATTERN.search(text))
 
     def extract_dates(self, text: str) -> List[Dict]:
-        """Извлекает все даты из текста"""
+        """Извлекает даты из текста"""
         dates_info = []
-
         if not text:
             return dates_info
 
         text_lower = text.lower()
 
-        # 1. Формат ДД.ММ.ГГ
+        # Формат ДД.ММ.ГГ
         for match in re.finditer(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", text):
             day, month, year = match.groups()
             day, month = int(day), int(month)
@@ -192,15 +212,13 @@ class FlightSearchAnalyzer:
                         "month": month,
                         "year": year,
                         "full_date": datetime(year, month, day),
-                        "original": match.group(0),
                     }
                 )
 
-        # 2. Формат ДД.ММ
+        # Формат ДД.ММ
         for match in re.finditer(r"(\d{1,2})[./](\d{1,2})(?![./\d])", text):
             day, month = match.groups()
             day, month = int(day), int(month)
-
             if 1 <= month <= 12 and 1 <= day <= 31:
                 dates_info.append(
                     {
@@ -208,11 +226,10 @@ class FlightSearchAnalyzer:
                         "month": month,
                         "year": TARGET_YEAR,
                         "full_date": datetime(TARGET_YEAR, month, day),
-                        "original": match.group(0),
                     }
                 )
 
-        # 3. Формат "5 марта"
+        # Формат "5 марта"
         months_ru = {
             "январ": 1,
             "феврал": 2,
@@ -239,7 +256,6 @@ class FlightSearchAnalyzer:
                             "month": month_num,
                             "year": TARGET_YEAR,
                             "full_date": datetime(TARGET_YEAR, month_num, day),
-                            "original": match.group(0),
                         }
                     )
 
@@ -260,7 +276,6 @@ class FlightSearchAnalyzer:
             return None
 
         prices = []
-
         for pattern in self.price_patterns:
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 price_str = match.group(1)
@@ -280,12 +295,8 @@ class FlightSearchAnalyzer:
 
         return min(prices) if prices else None
 
-    def has_any_date(self, text: str) -> bool:
-        """Проверяет, есть ли в тексте вообще какие-то даты"""
-        return bool(self.has_date_pattern.search(text))
-
     def extract_months_from_text(self, text: str) -> List[int]:
-        """Извлекает все упомянутые месяцы из текста"""
+        """Извлекает упомянутые месяцы"""
         months = []
         text_lower = text.lower()
 
@@ -312,38 +323,15 @@ class FlightSearchAnalyzer:
         return months
 
     def is_relevant(self, text: str) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Проверяет, релевантно ли сообщение
-        """
+        """Проверяет релевантность сообщения"""
         if not text or len(text) < MIN_TEXT_LENGTH:
             return False, {}
 
-        # 1. Проверяем наличие Индии/Гоа (целые слова)
-        has_india = self.has_india_destination(text)
-        if not has_india:
+        # Проверяем наличие Индии
+        if not self.has_india_destination(text):
             return False, {}
 
-        # 2. Извлекаем данные
-        all_dates = self.extract_dates(text)
-        mentioned_months = self.extract_months_from_text(text)
-        price = self.extract_price(text)
-
-        # 3. Анализируем даты
-        target_month_dates = []
-        other_dates = []
-
-        for date_info in all_dates:
-            if date_info.get("month") == TARGET_MONTH:
-                target_month_dates.append(date_info)
-            else:
-                other_dates.append(date_info)
-
-        has_target_month_date = len(target_month_dates) > 0
-        has_any_date_in_text = len(all_dates) > 0
-        has_mention_of_march = TARGET_MONTH in mentioned_months
-
-        # 4. Дополнительная проверка на контекст (исключаем круизы и т.д.)
-        text_lower = text.lower()
+        # Исключаем круизы
         exclude_keywords = [
             "круиз",
             "круизы",
@@ -352,129 +340,126 @@ class FlightSearchAnalyzer:
             "ship",
             "теплоход",
         ]
-        has_exclude = any(keyword in text_lower for keyword in exclude_keywords)
-
-        if has_exclude:
-            logger.info(f"Excluded due to keyword: {text_lower[:100]}")
+        if any(keyword in text.lower() for keyword in exclude_keywords):
             return False, {}
 
-        # Логика принятия решения:
+        # Извлекаем данные
+        all_dates = self.extract_dates(text)
+        mentioned_months = self.extract_months_from_text(text)
+        price = self.extract_price(text)
+
+        # Анализируем даты
+        target_month_dates = [
+            d for d in all_dates if d.get("month") == TARGET_MONTH
+        ]
+        has_target_month_date = len(target_month_dates) > 0
+        has_any_date = len(all_dates) > 0
+        has_march_mention = TARGET_MONTH in mentioned_months
+
+        # Логика отбора
         if has_target_month_date:
-            # Есть конкретные даты в марте
-            is_match = True
-            reason = "exact_march_dates"
-        elif has_mention_of_march and SEND_IF_NO_DATE:
-            # Нет конкретных дат, но есть упоминание марта
-            is_match = True
-            reason = "march_mentioned"
-        elif not has_any_date_in_text and SEND_IF_NO_DATE:
-            # Дат вообще нет
-            is_match = True
-            reason = "no_dates"
-        elif has_any_date_in_text and not has_target_month_date:
-            # Даты есть, но не март - пропускаем
-            is_match = False
-            reason = "wrong_month"
-        else:
-            is_match = False
-            reason = "unknown"
+            return True, {
+                "destinations": list(
+                    set(re.findall(DEST_PATTERN, text.lower()))
+                ),
+                "target_month_dates": target_month_dates,
+                "price": price,
+                "reason": "exact_dates",
+            }
+        elif has_march_mention and SEND_IF_NO_DATE:
+            return True, {
+                "destinations": list(
+                    set(re.findall(DEST_PATTERN, text.lower()))
+                ),
+                "target_month_dates": [],
+                "price": price,
+                "reason": "march_mentioned",
+            }
+        elif not has_any_date and SEND_IF_NO_DATE:
+            return True, {
+                "destinations": list(
+                    set(re.findall(DEST_PATTERN, text.lower()))
+                ),
+                "target_month_dates": [],
+                "price": price,
+                "reason": "no_dates",
+            }
 
-        if is_match:
-            logger.info(f"✅ MATCH ({reason}): {text[:100]}...")
-
-        return is_match, {
-            "destinations": list(set(re.findall(DEST_PATTERN, text.lower()))),
-            "all_dates": all_dates,
-            "target_month_dates": target_month_dates,
-            "mentioned_months": mentioned_months,
-            "price": price,
-            "has_target_month_date": has_target_month_date,
-            "has_march_mention": has_mention_of_march,
-            "reason": reason,
-        }
+        return False, {}
 
 
 async def monitor_channels():
     """Основная функция мониторинга"""
     logger.info("=" * 50)
-    logger.info(f"Starting flight monitoring cycle")
+    logger.info("Starting flight monitoring cycle")
     logger.info(f"Looking for flights to India/Goa in March {TARGET_YEAR}")
-    logger.info(f"SEND_IF_NO_DATE = {SEND_IF_NO_DATE}")
     logger.info("=" * 50)
 
-    # Инициализация
-    state = RedisState(redis_url)
-    await state.connect()
+    # Инициализация файлового хранилища
+    state = FileState(STATE_FILE)
 
+    # Подключение к Telegram
     client = TelegramClient("session", api_id, api_hash)
     await client.start(phone=phone_number)
 
     analyzer = FlightSearchAnalyzer()
     found_messages = []
 
-    # Фильтруем пустые каналы
+    # Фильтруем каналы
     valid_channels = []
     for ch in CHANNELS:
         cleaned = clean_channel(ch)
         if cleaned:
             valid_channels.append(cleaned)
-        else:
-            logger.warning(f"Skipping empty channel: '{ch}'")
 
     for channel in valid_channels:
         try:
             logger.info(f"📡 Checking channel: {channel}")
 
             # Получаем последние сообщения
-            last_id = await state.get_last_id(channel)
+            last_id = state.get_last_id(channel)
             messages = []
             async for msg in client.iter_messages(channel, limit=50):
                 messages.append(msg)
 
-            # Обрабатываем от старых к новым
             messages.sort(key=lambda x: x.id)
             new_messages = [m for m in messages if m.id > last_id]
 
             if new_messages:
-                logger.info(
-                    f"Found {len(new_messages)} new messages in {channel}"
-                )
+                logger.info(f"Found {len(new_messages)} new messages")
 
             for msg in new_messages:
-                # Проверяем на дубликат
-                if await state.is_duplicate(channel, msg.id):
+                if state.is_duplicate(channel, msg.id):
                     continue
 
-                # Анализируем сообщение
                 if msg.text:
                     is_match, details = analyzer.is_relevant(msg.text)
 
                     if is_match:
-                        logger.info(
-                            f"✅ RELEVANT FLIGHT FOUND in {channel}: ID {msg.id}"
-                        )
+                        logger.info(f"✅ Found match in {channel}: ID {msg.id}")
 
-                        # Форматируем даты для вывода
-                        if details["target_month_dates"]:
+                        # Форматируем даты
+                        if details.get("target_month_dates"):
                             date_str = ", ".join(
                                 [
                                     f"{d['day']:02d}.{d['month']:02d}"
                                     for d in details["target_month_dates"]
                                 ]
                             )
-                        elif details["has_march_mention"]:
+                        elif details.get("reason") == "march_mentioned":
                             date_str = "март"
                         else:
                             date_str = "дата не указана"
 
-                        dest_str = ", ".join(set(details["destinations"]))
+                        dest_str = ", ".join(
+                            details.get("destinations", ["индия"])
+                        )
                         price_str = (
                             f"{details['price']:,}₽".replace(",", " ")
-                            if details["price"]
+                            if details.get("price")
                             else "цена не указана"
                         )
 
-                        # Короткий превью текста
                         preview = (
                             msg.text[:300] + "..."
                             if len(msg.text) > 300
@@ -484,23 +469,18 @@ async def monitor_channels():
                         found_messages.append(
                             {
                                 "channel": channel,
-                                "text": msg.text,
                                 "preview": preview,
-                                "id": msg.id,
-                                "date": msg.date,
                                 "link": f"https://t.me/{channel}/{msg.id}",
-                                "details": details,
                                 "summary": f"📅 {date_str} | ✈️ {dest_str} | 💰 {price_str}",
                             }
                         )
 
-                # Отмечаем как обработанное
-                await state.mark_processed(channel, msg.id)
+                state.mark_processed(channel, msg.id)
 
             # Обновляем последний ID
             if messages:
                 max_id = max(m.id for m in messages)
-                await state.set_last_id(channel, max_id)
+                state.set_last_id(channel, max_id)
 
         except Exception as e:
             logger.error(f"Error checking {channel}: {e}")
@@ -508,37 +488,27 @@ async def monitor_channels():
     # Отправка результатов
     if found_messages:
         for msg in found_messages:
-            # Формируем красивое сообщение
-            header = f"✈️ **{msg['channel']}**\n"
-            header += f"_{msg['summary']}_\n\n"
-
-            # Добавляем превью текста
-            full_text = (
-                header
-                + msg["preview"]
-                + f"\n\n[👉 Открыть пост]({msg['link']})"
-            )
+            text = f"✈️ **{msg['channel']}**\n"
+            text += f"_{msg['summary']}_\n\n"
+            text += msg["preview"] + f"\n\n[👉 Открыть пост]({msg['link']})"
 
             await client.send_message(
-                my_user_id, full_text, parse_mode="md", link_preview=False
+                my_user_id, text, parse_mode="md", link_preview=False
             )
 
         logger.info(f"Sent {len(found_messages)} matches")
     else:
-        logger.info("No matches found in this cycle")
+        logger.info("No matches found")
         await client.send_message(
             my_user_id,
-            f"🔍 Мониторинг завершен: новых предложений в Индию на март {TARGET_YEAR} не найдено",
+            f"🔍 Мониторинг: новых предложений в Индию на март {TARGET_YEAR} не найдено",
         )
 
-    # Закрываем соединения
-    await state.disconnect()
     await client.disconnect()
     logger.info("Monitoring cycle completed")
 
 
 async def main():
-    """Точка входа"""
     try:
         await monitor_channels()
     except Exception as e:
