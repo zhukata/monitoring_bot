@@ -38,6 +38,7 @@ jobs:
         API_HASH: ${{ secrets.API_HASH }}
         PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
         MY_USER_ID: ${{ secrets.MY_USER_ID }}
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       run: python main.py
       
     - name: Upload session file (if changed)

@@ -153,7 +153,7 @@ class FileState:
             try:
                 with open(self.state_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except:
+            except:  # noqa: E722
                 return {}
         return {}
 
