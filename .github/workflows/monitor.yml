@@ -3,6 +3,8 @@ name: Telegram Flight Monitor
 on:
   schedule:
     - cron: '*/30 * * * *'  # каждые 30 минут
+  push:
+    branches: [ main ]
   workflow_dispatch:  # ручной запуск
 
 jobs:
