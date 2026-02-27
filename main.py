@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 import re
+import html
 import requests  # добавил импорт
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
@@ -10,8 +11,13 @@ from telethon import TelegramClient
 from dotenv import load_dotenv
 
 
-if os.path.exists("session.session"):
-    os.chmod("session.session", 0o600)  # правильные права доступа
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSION_NAME = os.path.join(BASE_DIR, "session")
+SESSION_FILE = f"{SESSION_NAME}.session"
+STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+
+if os.path.exists(SESSION_FILE):
+    os.chmod(SESSION_FILE, 0o600)  # правильные права доступа
 
 
 load_dotenv()
@@ -57,6 +63,13 @@ DEPARTURE_CITIES = [
     "zia",
 ]
 
+# Явное указание вылета "не из Москвы" должно исключать сообщение.
+# Если вылет не указан — сообщение допускаем.
+MOSCOW_DEPARTURE_PATTERN = re.compile(
+    r"(?<!\w)(" + "|".join(re.escape(x) for x in DEPARTURE_CITIES) + r")(?!\w)",
+    re.IGNORECASE,
+)
+
 # Направления - ТОЛЬКО ПОЛНЫЕ СЛОВА!
 DESTINATIONS = [
     r"\bиндия\b",
@@ -89,7 +102,6 @@ MIN_TEXT_LENGTH = 50
 # =====================================
 
 # Файл для хранения состояния
-STATE_FILE = "bot_state.json"
 # =====================================
 
 
@@ -112,18 +124,11 @@ def send_telegram_message(text: str) -> bool:
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-    # Экранируем спецсимволы для Markdown
-    # Заменяем ** на жирный текст, но экранируем остальное
-    escaped_text = (
-        text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-    )
-    # Возвращаем ** обратно для жирного текста
-    escaped_text = escaped_text.replace("\\*\\*", "**")
-
     payload = {
         "chat_id": my_user_id,
-        "text": escaped_text,
-        "parse_mode": "Markdown",
+        "text": text,
+        # HTML-режим проще и надёжнее: не ломает ссылки из-за `_` в URL
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
 
@@ -153,14 +158,18 @@ class FileState:
             try:
                 with open(self.state_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except:  # noqa: E722
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Failed to load state file {self.state_file}: {e}")
                 return {}
         return {}
 
     def _save(self):
         """Сохраняет состояние в файл"""
-        with open(self.state_file, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        tmp_file = f"{self.state_file}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, self.state_file)
 
     def get_last_id(self, channel: str) -> int:
         """Получить последний обработанный ID"""
@@ -211,6 +220,8 @@ class FlightSearchAnalyzer:
             r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s?(?:руб|р\.?|₽)\b",
             r"за\s+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s*(?:руб|р\.?|₽)",
             r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s*р(?!уб)",
+            # Часто в каналах цена пишется как "60500P" (латинская P)
+            r"(\d{4,6})\s*[pP]\b",
         ]
 
         self.has_date_pattern = re.compile(
@@ -332,6 +343,70 @@ class FlightSearchAnalyzer:
 
         return min(prices) if prices else None
 
+    def _detect_departure(self, text: str) -> Dict[str, Any]:
+        """
+        Определяет, указан ли вылет, и из Москвы ли он.
+        Правило:
+        - если явно указан вылет НЕ из Москвы -> исключаем
+        - если указан из Москвы -> допускаем
+        - если вылет не указан -> допускаем
+        """
+        if not text:
+            return {"explicit": False, "is_moscow": None, "value": None}
+
+        stopwords = {
+            "перелетотель",
+            "перелётотель",
+            "перелет",
+            "перелёт",
+            "отель",
+            "тур",
+            "туры",
+            "сибирь",
+        }
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            line_lower = line.lower()
+
+            # Ищем только явные строки про вылет (чтобы не ловить "из" в обычном тексте)
+            if "вылет" not in line_lower and "departure" not in line_lower:
+                continue
+            if " из" not in line_lower and " from" not in line_lower:
+                continue
+
+            m = re.search(
+                r"(?:вылет|departure)\s*(?:из|from)\s*[:\-]?\s*(.*)$",
+                line_lower,
+                flags=re.IGNORECASE,
+            )
+            rest = m.group(1) if m else line_lower
+
+            # приоритет: первый "похожий на город" хэштег/токен после "вылет из"
+            candidates = re.findall(r"#([a-zа-яё][\w\-]{2,})", rest, flags=re.IGNORECASE)
+            if not candidates:
+                candidates = re.findall(r"[a-zа-яё][a-zа-яё\-]{2,}", rest, flags=re.IGNORECASE)
+
+            value = None
+            for c in candidates:
+                c_norm = c.strip().lower()
+                if c_norm in stopwords:
+                    continue
+                value = c_norm
+                break
+
+            # если после "вылет из" ничего осмысленного не нашли — считаем, что город не указан
+            if not value:
+                return {"explicit": True, "is_moscow": None, "value": None}
+
+            # Москва/аэропорты Москвы
+            if MOSCOW_DEPARTURE_PATTERN.search(value) or MOSCOW_DEPARTURE_PATTERN.search(rest):
+                return {"explicit": True, "is_moscow": True, "value": value}
+
+            return {"explicit": True, "is_moscow": False, "value": value}
+
+        return {"explicit": False, "is_moscow": None, "value": None}
+
     def extract_months_from_text(self, text: str) -> List[int]:
         """Извлекает упомянутые месяцы"""
         months = []
@@ -380,6 +455,11 @@ class FlightSearchAnalyzer:
         if any(keyword in text.lower() for keyword in exclude_keywords):
             return False, {}
 
+        # Фильтр по вылету: если явно НЕ Москва — исключаем
+        departure = self._detect_departure(text)
+        if departure.get("explicit") and departure.get("is_moscow") is False:
+            return False, {}
+
         # Извлекаем данные
         all_dates = self.extract_dates(text)
         mentioned_months = self.extract_months_from_text(text)
@@ -401,6 +481,7 @@ class FlightSearchAnalyzer:
                 ),
                 "target_month_dates": target_month_dates,
                 "price": price,
+                "departure": departure,
                 "reason": "exact_dates",
             }
         elif has_march_mention and SEND_IF_NO_DATE:
@@ -410,6 +491,7 @@ class FlightSearchAnalyzer:
                 ),
                 "target_month_dates": [],
                 "price": price,
+                "departure": departure,
                 "reason": "march_mentioned",
             }
         elif not has_any_date and SEND_IF_NO_DATE:
@@ -419,6 +501,7 @@ class FlightSearchAnalyzer:
                 ),
                 "target_month_dates": [],
                 "price": price,
+                "departure": departure,
                 "reason": "no_dates",
             }
 
@@ -436,7 +519,7 @@ async def monitor_channels():
     state = FileState(STATE_FILE)
 
     # Подключение к Telegram
-    client = TelegramClient("session", api_id, api_hash)
+    client = TelegramClient(SESSION_NAME, api_id, api_hash)
     await client.start(phone=phone_number)
 
     analyzer = FlightSearchAnalyzer()
@@ -456,7 +539,7 @@ async def monitor_channels():
             # Получаем последние сообщения
             last_id = state.get_last_id(channel)
             messages = []
-            async for msg in client.iter_messages(channel, limit=50):
+            async for msg in client.iter_messages(channel, min_id=last_id, limit=200):
                 messages.append(msg)
 
             messages.sort(key=lambda x: x.id)
@@ -515,8 +598,8 @@ async def monitor_channels():
                 state.mark_processed(channel, msg.id)
 
             # Обновляем последний ID
-            if messages:
-                max_id = max(m.id for m in messages)
+            if new_messages:
+                max_id = max(m.id for m in new_messages)
                 state.set_last_id(channel, max_id)
 
         except Exception as e:
@@ -525,9 +608,15 @@ async def monitor_channels():
     # Отправка результатов через бота (а не через клиента)
     if found_messages:
         for msg in found_messages:
-            text = f"✈️ **{msg['channel']}**\n"
-            text += f"_{msg['summary']}_\n\n"
-            text += msg["preview"] + f"\n\n[👉 Открыть пост]({msg['link']})"
+            ch = html.escape(msg["channel"])
+            summary = html.escape(msg["summary"])
+            preview = html.escape(msg["preview"])
+            link = msg["link"]
+
+            text = f"✈️ <b>{ch}</b>\n"
+            text += f"<i>{summary}</i>\n\n"
+            text += f"{preview}\n\n"
+            text += f'<a href="{link}">👉 Открыть пост</a>'
 
             # Отправляем через бота
             send_telegram_message(text)
@@ -537,7 +626,9 @@ async def monitor_channels():
         logger.info("No matches found")
         # Отправляем уведомление через бота
         send_telegram_message(
-            f"🔍 Мониторинг: новых предложений в Индию на март {TARGET_YEAR} не найдено"
+            html.escape(
+                f"🔍 Мониторинг: новых предложений в Индию на март {TARGET_YEAR} не найдено"
+            )
         )
 
     await client.disconnect()
@@ -551,7 +642,9 @@ async def main():
         logger.error(f"Fatal error: {e}")
         # Пробуем отправить ошибку через бота
         if bot_token:
-            send_telegram_message(f"❌ Ошибка мониторинга: {str(e)[:200]}")
+            send_telegram_message(
+                html.escape(f"❌ Ошибка мониторинга: {str(e)[:200]}")
+            )
         raise
 
 
